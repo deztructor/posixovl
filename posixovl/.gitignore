@@ -1,0 +1,14 @@
+*.o
+.deps
+Makefile
+Makefile.in
+
+/autom4te.cache/
+/aclocal.m4
+/build-aux/
+/config.*
+/configure
+/lntest
+/mount.posixovl
+/socket
+/stamp-h1
