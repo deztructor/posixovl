@@ -1,0 +1,86 @@
+#!/bin/bash -x
+
+function announce()
+{
+	set +x;
+	if [ -t 0 ]; then echo -en "\e[1;37;44m"; fi;
+	echo -en "$1";
+	if [ -t 0 ]; then echo -e "\e[0m"; fi;
+	set -x;
+}
+
+#
+# So that the root tests can also be run when - for some reason -
+# you do not have UID 0. (`do_root_tests=1 ./fs-test`)
+#
+if [ -z "$do_root_tests" ]; then
+	[ "`id -u`" -eq 0 ];
+	do_root_tests=$[!$?];
+fi;
+
+set -e;
+trap "echo failed" EXIT;
+
+announce "mass links (trigger fuse cache artifact)";
+echo hello world >w0;
+ln w0 w1;
+ln w1 w2;
+ln w1 w3;
+ln w1 w4;
+ln w1 w5;
+ln w1 w6;
+ln w5 w7;
+ln w5 w8;
+ls -li;
+usleep 600000;
+ls -li;
+rm -f w[012345678];
+
+announce "FIFO hardlink";
+mkfifo h1;
+ln h1 h2;
+
+# -- FUSE cheats us -- test does not work
+#result=$(
+#	echo -n "test1" >h1;
+#	echo -n "test2" >h2;
+#	head -n1 h2;
+#);
+#[ "$result" == "test1test2" -o "$result" == "test2test1" ];
+
+announce "hardlink FIFO deletion";
+rm -f h1;
+[ -e h2 ];
+rm -f h2;
+
+announce "creating tmp files";
+echo f1 >f1;
+echo f2 >f2;
+echo f3 >f3;
+
+announce "linking";
+ln -sf f1 q1;
+ln -f f2 q2;
+
+announce "verifying linked data ... ";
+cat f1 | grep -q f1;
+cat f2 | grep -q f2;
+
+announce "truncate";
+>f2;
+[ ! -s f2 ];
+
+if [ $do_root_tests -eq 1 ]; then
+	announce "changing ownerships and permissions";
+	chown 0:0 f1 f2 f3;
+	chmod ago+x f1 f2 f3;
+	chmod ago-x f1 f2 f3;
+
+	announce "special device creation";
+	mknod null c 1 3;
+	rm null;
+fi;
+
+rm f1 f2 f3 q1 q2;
+trap "" EXIT;
+announce "All done";
