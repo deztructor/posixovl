@@ -1,0 +1,6 @@
+posixovl provides a filesystem view that supports various POSIX operations while
+using an otherwise incapable lower filesystem. Filesystems of various degrees of
+POSIXness can be utilitzed. VFAT is a common denominator when it comes to
+cross-compatibility, though NTFS its features are unused in Linux would be
+another possibility. Secondly, potent native POSIX-style filesystems can also be
+used, though the actual use of doing that remains to be discovered.
