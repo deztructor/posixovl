@@ -127,6 +127,35 @@ struct hcb {
 	int fd;
 };
 
+typedef enum {
+    should_be_valid,
+    could_be_invalid
+} close_option;
+
+static bool hcb_close(struct hcb *hcb, close_option option)
+{
+    if (hcb->fd < 0) {
+        if (option == should_be_valid)
+            should_not_happen();
+        return false;
+    } else {
+        close(hcb->fd);
+        hcb->fd = -1;
+        return true;
+    }
+}
+
+/**
+ * Set a write lock on the entire of a file.
+ */
+static int hcb_openat(struct hcb *hcb, int dirfd, const char *pathname, int flags)
+{
+    if (hcb->fd >= 0)
+        should_not_happen();
+    hcb->fd = openat(dirfd, pathname, flags);
+    return hcb->fd;
+}
+
 /* Global */
 static mode_t default_mode = S_IRUGO | S_IWUSR;
 static unsigned int assume_vfat, single_threaded, hardlink_with_copy;
@@ -358,6 +387,12 @@ static int ll_hcb_write(const char *path, struct ll_hcb *info, int fd)
 	return 0;
 }
 
+static void hcb_init(struct hcb *cb)
+{
+    memset(cb, 0, sizeof(*cb));
+    cb->fd = -1;
+}
+
 /**
  * hcb_new - create new HCB
  * @path:	file path (not HCB path)
@@ -373,8 +408,7 @@ static int hcb_new(const char *path, struct hcb *cb, unsigned int reuse)
 		if (cb->fd >= 0)
 			should_not_happen();
 	} else {
-		memset(cb, 0, sizeof(*cb));
-		cb->fd = -1;
+        hcb_init(cb);
 		if ((ret = real_to_hcb(cb->path, path)) < 0)
 			return ret;
 		if (fstatat(root_fd, at(path), &cb->sb,
@@ -406,8 +440,7 @@ static int hcb_get(const char *path, struct hcb *cb)
 {
 	int ret;
 
-	memset(cb, 0, sizeof(*cb));
-	cb->fd = -1;
+    hcb_init(cb);
 
 	/* Get inode number, size and times from the L0 file */
 	if (fstatat(root_fd, at(path), &cb->sb, AT_SYMLINK_NOFOLLOW) < 0)
@@ -420,24 +453,19 @@ static int hcb_get(const char *path, struct hcb *cb)
 
 	if ((ret = real_to_hcb(cb->path, path)) < 0)
 		return ret;
-	cb->fd = openat(root_fd, at(cb->path), O_RDWR);
-	if (cb->fd < 0 && errno == EACCES)
-		/* Retry read-only */
-		cb->fd = openat(root_fd, at(cb->path), O_RDONLY);
-	if (cb->fd < 0) {
-		if (errno == ENOENT)
-			return -ENOENT_HCB;
-		else
-			return -errno;
+
+	if (hcb_openat(cb, root_fd, at(cb->path), O_RDONLY) < 0) {
+		return (errno == ENOENT) ? -ENOENT_HCB : -errno;
 	}
+
 	if (lock_read(cb->fd) < 0) {
 		ret = -errno;
-		close(cb->fd);
+		hcb_close(cb, should_be_valid);
 		return ret;
 	}
 	ret = ll_hcb_read(cb->path, &cb->ll, cb->fd);
 	if (ret < 0) {
-		close(cb->fd);
+		hcb_close(cb, should_be_valid);
 		return ret;
 	}
 
@@ -461,11 +489,9 @@ static int hcb_get(const char *path, struct hcb *cb)
  * (Also because whether a change was made is not recorded. Explicitly call
  * hcb_update().)
  */
-static void hcb_put(const struct hcb *cb)
+static void hcb_put(struct hcb *cb)
 {
-	if (cb->fd < 0)
-		should_not_happen();
-	close(cb->fd);
+	hcb_close(cb, should_be_valid);
 }
 
 /**
@@ -480,12 +506,10 @@ static int hcb_deref(struct hcb *cb)
 	struct stat sb;
 	int ret;
 
-	if (cb->fd < 0)
-		should_never_happen();
 	if (!S_ISHARDLNK(cb->ll.mode))
 		return 0;
 
-	close(cb->fd);
+	hcb_close(cb, should_be_valid);
 	if (fstatat(root_fd, at(cb->ll.target), &sb,
 	    AT_SYMLINK_NOFOLLOW) < 0)
 		return -errno;
@@ -498,17 +522,16 @@ static int hcb_deref(struct hcb *cb)
 	cb->sb.st_mtime = sb.st_mtime;
 
 	hl_dtoi(cb->path, cb->ll.target);
-	cb->fd = openat(root_fd, at(cb->path), O_RDWR);
-	if (cb->fd < 0)
+	if (hcb_openat(cb, root_fd, at(cb->path), O_RDONLY) < 0)
 		return -errno;
 	if (lock_read(cb->fd) < 0) {
 		ret = -errno;
-		close(cb->fd);
+		hcb_close(cb, should_be_valid);
 		return ret;
 	}
 	ret = ll_hcb_read(cb->path, &cb->ll, cb->fd);
 	if (ret < 0) {
-		close(cb->fd);
+		hcb_close(cb, should_be_valid);
 		return ret;
 	}
 
@@ -553,22 +576,20 @@ static int hcb_get_deref(const char *path, struct hcb *cb)
 static int hcb_update(struct hcb *cb)
 {
 	int ret;
+    int flags = O_WRONLY;
 
-	if (cb->fd < 0) {
-		/* When this HCB was created using hcb_new() */
-		cb->fd = openat(root_fd, at(cb->path), O_RDWR | O_CREAT |
-		         O_EXCL, S_IRUGO | S_IWUSR);
-		if (cb->fd < 0)
-			return -errno;
-	}
+    /* When this HCB was created using hcb_new() */
+    if (!hcb_close(cb, could_be_invalid))
+        flags |= (O_CREAT | O_EXCL);
 
-	if (lock_write(cb->fd) < 0) {
-		ret = -errno;
-		close(cb->fd);
-		return ret;
-	}
+    cb->fd = openat(root_fd, at(cb->path), flags, S_IRUGO | S_IWUSR);
+    if (cb->fd < 0)
+        return -errno;
 
-	ret = ll_hcb_write(cb->path, &cb->ll, cb->fd);
+    ret = (lock_write(cb->fd) >= 0
+           ? ll_hcb_write(cb->path, &cb->ll, cb->fd)
+           : -errno);
+
 	hcb_put(cb);
 	return ret;
 }
