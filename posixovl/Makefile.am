@@ -1,14 +1,14 @@
 # -*- Makefile -*-
 
 AM_CPPFLAGS            = ${regular_CPPFLAGS}
-AM_CFLAGS              = $(regular_CFLAGS) $(libfuse_CFLAGS)
+AM_CFLAGS              = $(regular_CFLAGS) $(libfuse_CFLAGS) $(glib_CFLAGS)
 
 man_MANS = posixovl.1
 
 sbin_PROGRAMS          = mount.posixovl
 EXTRA_PROGRAMS         = socket lntest
 mount_posixovl_SOURCES = posixovl.c
-mount_posixovl_LDADD   = $(libfuse_LIBS)
+mount_posixovl_LDADD   = $(libfuse_LIBS) $(glib_LIBS)
 
 .PHONY: tarball
 tarball:

@@ -9,6 +9,7 @@ Source0: %{name}-%{version}.tar.bz2
 Requires: fuse >= 2.6.5
 BuildRequires: pkgconfig(fuse) >= 2.6.5
 BuildRequires: libattr-devel
+BuildRequires: pkgconfig(glib-2.0)
 
 %description
 A FUSE filesystem that provides POSIX functionality - UNIX-style

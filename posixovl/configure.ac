@@ -16,6 +16,8 @@ AC_SUBST([regular_CPPFLAGS])
 AC_SUBST([regular_CFLAGS])
 
 AC_CHECK_HEADER(attr/xattr.h, [], AC_MSG_ERROR([libattr-devel not installed]))
+AC_CHECK_LIB(pthread, pthread_create)
+AC_CHECK_HEADERS(pthread.h)
 
 # FUSE >= 2.7.0 got subtype name support.
 # 2.6.5 does not, but has a similar thing.
@@ -25,6 +27,8 @@ PKG_CHECK_MODULES([libfuse], [fuse >= 2.7.0], [], [
 			[Define if you have a FUSE version >= 2.6.5 but < 2.7.0])
 	])
 ])
+
+PKG_CHECK_MODULES([glib], [glib-2.0 >= 2.24.1])
 
 # Minium requirements for utimensat(): Linux 2.6.22-rc1 and Glibc 2.6
 AC_MSG_CHECKING([for utimensat()])

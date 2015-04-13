@@ -34,6 +34,10 @@
 #include <asm/unistd.h>
 #include <attr/xattr.h>
 #include "config.h"
+#include <glib.h>
+#include <sys/timerfd.h>
+#include <poll.h>
+
 #ifndef S_IRUGO
 #	define S_IRUGO (S_IRUSR | S_IRGRP | S_IROTH)
 #	define S_IWUGO (S_IWUSR | S_IWGRP | S_IWOTH)
@@ -99,6 +103,7 @@ enum {
 	ENOENT_HCB = 4096,
 };
 
+
 /**
  * ll_hcb - lowlevel HCB
  * @buf:	buffer for contents of HCB file
@@ -124,7 +129,6 @@ struct hcb {
 	char path[PATH_MAX];
 	struct ll_hcb ll;
 	struct stat sb;
-	int fd;
 };
 
 typedef enum {
@@ -134,34 +138,70 @@ typedef enum {
 
 static bool hcb_close(struct hcb *hcb, close_option option)
 {
-    if (hcb->fd < 0) {
-        if (option == should_be_valid)
-            should_not_happen();
-        return false;
-    } else {
-        close(hcb->fd);
-        hcb->fd = -1;
-        return true;
-    }
+    /* if (hcb->fd < 0) { */
+    /*     if (option == should_be_valid) */
+    /*         should_not_happen(); */
+    /*     return false; */
+    /* } else { */
+    /*     close(hcb->fd); */
+    /*     hcb->fd = -1; */
+    /*     return true; */
+    /* } */
+    // TODO remove
+    return false;
 }
 
-/**
- * Set a write lock on the entire of a file.
- */
-static int hcb_openat(struct hcb *hcb, int dirfd, const char *pathname, int flags)
-{
-    if (hcb->fd >= 0)
-        should_not_happen();
-    hcb->fd = openat(dirfd, pathname, flags);
-    return hcb->fd;
-}
+/* static int hcb_open(struct hcb *hcb, const char *pathname, int flags) */
+/* { */
+/*     if (hcb->fd >= 0) */
+/*         should_not_happen(); */
+/*     hcb->fd = openat(root_fd, pathname, flags); */
+/*     return hcb->fd; */
+/* } */
 
 /* Global */
 static mode_t default_mode = S_IRUGO | S_IWUSR;
-static unsigned int assume_vfat, single_threaded, hardlink_with_copy;
+static unsigned int assume_vfat, is_single_threaded, hardlink_with_copy, is_ll_write_cached;
 static const char *root_dir;
 static int root_fd;
 static pthread_mutex_t posixovl_protect = PTHREAD_MUTEX_INITIALIZER;
+
+struct threading
+{
+    int (*rwlock_init)(pthread_rwlock_t *restrict
+                       , const pthread_rwlockattr_t *restrict);
+    int (*rwlock_wrlock)(pthread_rwlock_t *);
+    int (*rwlock_rdlock)(pthread_rwlock_t *);
+    int (*rwlock_unlock)(pthread_rwlock_t *);
+};
+
+static struct threading multi_threaded = {
+    .rwlock_init = &pthread_rwlock_init,
+    .rwlock_wrlock = &pthread_rwlock_wrlock,
+    .rwlock_rdlock = &pthread_rwlock_rdlock,
+    .rwlock_unlock = &pthread_rwlock_unlock
+};
+
+int fake_rwlock_init(pthread_rwlock_t *restrict
+                     , const pthread_rwlockattr_t *restrict);
+int fake_rwlock_wrlock(pthread_rwlock_t *);
+int fake_rwlock_rdlock(pthread_rwlock_t *);
+int fake_rwlock_unlock(pthread_rwlock_t *);
+
+int fake_rwlock_init(pthread_rwlock_t *restrict lock
+                       , const pthread_rwlockattr_t *restrict attr) { return 0; }
+int fake_rwlock_wrlock(pthread_rwlock_t * lock) { return 0; }
+int fake_rwlock_rdlock(pthread_rwlock_t * lock) { return 0; }
+int fake_rwlock_unlock(pthread_rwlock_t * lock) { return 0; }
+
+static struct threading single_threaded = {
+    .rwlock_init = &fake_rwlock_init,
+    .rwlock_wrlock = &fake_rwlock_wrlock,
+    .rwlock_rdlock = &fake_rwlock_rdlock,
+    .rwlock_unlock = &fake_rwlock_unlock
+};
+
+static struct threading * threading = &multi_threaded;
 
 static inline int retcode_int(int code)
 {
@@ -184,7 +224,7 @@ static int lock_read(int fd)
 		.l_start  = 0,
 		.l_len    = 0,
 	};
-	if (single_threaded)
+	if (is_single_threaded)
 		return 0;
 	return fcntl(fd, F_SETLKW, &fl);
 }
@@ -200,7 +240,7 @@ static int lock_write(int fd)
 		.l_start  = 0,
 		.l_len    = 0,
 	};
-	if (single_threaded)
+	if (is_single_threaded)
 		return 0;
 	return fcntl(fd, F_SETLK, &fl);
 }
@@ -390,7 +430,6 @@ static int ll_hcb_write(const char *path, struct ll_hcb *info, int fd)
 static void hcb_init(struct hcb *cb)
 {
     memset(cb, 0, sizeof(*cb));
-    cb->fd = -1;
 }
 
 /**
@@ -405,8 +444,6 @@ static int hcb_new(const char *path, struct hcb *cb, unsigned int reuse)
 	int ret;
 
 	if (reuse) {
-		if (cb->fd >= 0)
-			should_not_happen();
 	} else {
         hcb_init(cb);
 		if ((ret = real_to_hcb(cb->path, path)) < 0)
@@ -426,6 +463,461 @@ static int hcb_new(const char *path, struct hcb *cb, unsigned int reuse)
 	return 0;
 }
 
+static struct hcb_cache {
+    pthread_rwlock_t lock;
+    GHashTable *data;
+    GHashTable *dirty;
+    bool is_exit;
+    int flush_fd;
+    pthread_t flush_thread;
+    bool is_flush_scheduled;
+} hcb_cache;
+
+struct hcb_entry
+{
+	char path[PATH_MAX];
+	struct ll_hcb ll;
+};
+
+struct hcb_cache_save_result
+{
+    int rc;
+    int count;
+    GHashTable *left;
+};
+
+static int hcb_cache_save_result_init(struct hcb_cache_save_result *);
+static int hcb_entry_init(struct hcb_entry *, char const *);
+static int hcb_entry_from(struct hcb_entry *, char const *
+                          , struct ll_hcb const *);
+static void hcb_entry_release(struct hcb_entry*);
+static int hcb_entry_file_load(struct hcb_entry *self);
+static int hcb_entry_file_save(struct hcb_entry *self);
+
+static int hcb_cache_init(struct hcb_cache *);
+static void hcb_cache_release(void);
+static struct hcb_cache * hcb_cache_lock_read(void);
+static struct hcb_cache * hcb_cache_lock_write(void);
+static void hcb_cache_unlock(struct hcb_cache **self);
+static struct hcb_entry *hcb_cache_find_(GHashTable *t, char const *name);
+static int hcb_cache_copy_
+(struct hcb_cache *self, char const *name, struct ll_hcb *hcb);
+static int hcb_cache_load_get(char const *name, struct ll_hcb *hcb);
+static int hcb_cache_get(char const *name, struct ll_hcb *hcb);
+static int hcb_cache_set(char const *name, struct ll_hcb const *hcb);
+static void hcb_cache_entry_flush_
+(gpointer key, gpointer value, gpointer user_data);
+static int hcb_cache_flush_(struct hcb_cache *);
+static void* flush_thread(void *);
+static void free_gptr_entry(gpointer);
+
+static void free_gptr_entry(gpointer data)
+{
+    hcb_entry_release((struct hcb_entry*)data);
+}
+
+
+#define TRACE_D(msg, args...) fprintf(stderr, "D: %s " msg "\n", __PRETTY_FUNCTION__, args)
+#define TRACE_W(msg, args...) fprintf(stderr, "W: %s " msg "\n", __PRETTY_FUNCTION__, args)
+#define TRACE_E(msg, args...) fprintf(stderr, "E: %s " msg "\n", __PRETTY_FUNCTION__, args)
+
+static int hcb_cache_save_result_init(struct hcb_cache_save_result *self)
+{
+    self->rc = 0;
+    self->count = 0;
+    self->left = g_hash_table_new(g_direct_hash, g_direct_equal);
+    return 0;
+}
+
+static void hcb_cache_save_result_release(struct hcb_cache_save_result *self)
+{
+    if (self->left)
+        g_hash_table_destroy(self->left);
+}
+
+static int hcb_entry_init(struct hcb_entry *self, char const *name)
+{
+    int rc;
+    static const size_t max_len = sizeof(self->path) - 1;
+    int len = snprintf(self->path, max_len, "%s", name);
+    if (len < max_len) {
+        memset(&self->ll, 0, sizeof(self->ll));
+        rc = 0;
+    } else {
+        memset(self->path, 0, sizeof(self->path));
+        rc = -EINVAL;
+    }
+
+    return rc;
+}
+
+static int hcb_entry_from(struct hcb_entry *self, char const *name
+                          , struct ll_hcb const *ll)
+{
+    int rc;
+    rc = hcb_entry_init(self, name);
+    if (!rc) {
+        memcpy(&self->ll, ll, sizeof(self->ll));
+    }
+    return rc;
+}
+
+static void hcb_entry_release(struct hcb_entry *self)
+{
+    free(self);
+}
+
+static int hcb_entry_file_load(struct hcb_entry *self)
+{
+    TRACE_D("path: %s", self->path);
+    int rc = 0;
+    int fd = openat(root_fd, self->path, O_RDONLY);
+    if (fd >= 0) {
+        TRACE_D("found: %s", self->path);
+        rc = lock_read(fd);
+        if (!rc) {
+            rc = ll_hcb_read(self->path, &self->ll, fd);
+        }
+        close(fd);
+    } else {
+        rc = -ENOENT;
+    }
+    TRACE_D("rc=%d", rc);
+    return rc;
+}
+
+static int hcb_entry_file_save(struct hcb_entry *self)
+{
+    int rc = 0;
+    TRACE_D("save: %s", self->path);
+    int flags = O_WRONLY;
+    mode_t mode = S_IRUGO | S_IWUSR;
+    TRACE_D("dirty: %s", self->path);
+    int fd = openat(root_fd, self->path, flags, mode);
+    if (fd < 0) {
+        flags |= (O_CREAT | O_EXCL);
+        fd = openat(root_fd, self->path, flags, S_IRUGO | S_IWUSR);
+        if (fd < 0) {
+            TRACE_E("Can't nor open nor create %s: %s", self->path, strerror(errno));
+            return -errno;
+        }
+    }
+    rc = (lock_write(fd) >= 0
+          ? ll_hcb_write(self->path, &self->ll, fd)
+          : -errno);
+    close(fd);
+    TRACE_D("save: rc=%d", rc);
+    return rc;
+}
+
+static int hcb_cache_init(struct hcb_cache *self)
+{
+    int rc;
+    threading->rwlock_init(&self->lock, NULL);
+    self->data = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, free_gptr_entry);
+    self->dirty = g_hash_table_new(g_direct_hash, g_direct_equal);
+    if (is_ll_write_cached) {
+        self->is_exit = false;
+        self->is_flush_scheduled = false;
+        self->flush_fd = timerfd_create(CLOCK_MONOTONIC, 0);
+        rc = pthread_create(&self->flush_thread, NULL, flush_thread, &hcb_cache);
+    } else {
+        rc = 0;
+    }
+    return rc;
+}
+
+static struct hcb_cache * hcb_cache_lock_read()
+{
+    threading->rwlock_rdlock(&hcb_cache.lock);
+    return &hcb_cache;
+}
+
+static struct hcb_cache * hcb_cache_lock_write()
+{
+    threading->rwlock_wrlock(&hcb_cache.lock);
+    return &hcb_cache;
+}
+
+static void hcb_cache_unlock(struct hcb_cache **pself)
+{
+    if (*pself) {
+        threading->rwlock_unlock(&(*pself)->lock);
+        *pself = NULL;
+    } else {
+        TRACE_W("Unlock: logical error %p", pself);
+    }
+}
+
+static void hcb_cache_release()
+{
+    int rc;
+    struct hcb_cache *cache;
+    if (is_ll_write_cached) {
+        cache = hcb_cache_lock_write();
+        struct itimerspec timeout = {
+            .it_interval = { .tv_sec = 0, .tv_nsec = 0 },
+            .it_value = { .tv_sec = 0, .tv_nsec = 1 }
+        };
+        cache->is_exit = true;
+        TRACE_D("Ask flush thread %d to exit", cache->flush_fd);
+        rc = timerfd_settime(cache->flush_fd, 0, &timeout, NULL);
+        hcb_cache_unlock(&cache);
+        if (!rc) {
+            void *res;
+            rc = pthread_join(cache->flush_thread, &res);
+            if (rc)
+                TRACE_E("rc=%d joining flush thread", rc);
+        } else {
+            TRACE_E("rc=%d setting timer, ignore thread, exit", rc);
+        }
+    } else {
+        cache = &hcb_cache;
+    }
+
+    // no protection, should be executed in the last thread
+    g_hash_table_destroy(cache->dirty);
+    g_hash_table_destroy(cache->data);
+}
+
+static struct hcb_entry *hcb_cache_find_(GHashTable *t, char const *name)
+{
+    return (struct hcb_entry *)g_hash_table_lookup(t, name);
+}
+
+static int hcb_cache_copy_
+(struct hcb_cache *self, char const *name, struct ll_hcb *hcb)
+{
+    struct hcb_entry *entry = hcb_cache_find_(self->data, name);
+    TRACE_D("copy: %p", entry);
+    int rc = 1;
+    if (entry) {
+        memcpy(hcb, &entry->ll, sizeof(hcb[0]));
+        rc = 0;
+    }
+    return rc;
+}
+
+static int hcb_cache_load_get(char const *name, struct ll_hcb *hcb)
+{
+    int rc;
+    struct hcb_cache *cache = hcb_cache_lock_write();
+    TRACE_D("path: %s", name);
+    struct hcb_entry *self = malloc(sizeof(self[0]));
+    rc = hcb_entry_init(self, name);
+    if (!rc) {
+        rc = hcb_entry_file_load(self);
+        if (rc >= 0) {
+            g_hash_table_insert(cache->data, g_strdup(name), self);
+            memcpy(hcb, &self->ll, sizeof(hcb[0]));
+        }
+    } else {
+        TRACE_E("rc=%d", rc);
+    }
+    hcb_cache_unlock(&cache);
+    TRACE_D("rc=%d", rc);
+    return rc;
+}
+
+static int hcb_cache_get(char const *name, struct ll_hcb *hcb)
+{
+    struct hcb_cache *cache = hcb_cache_lock_read();
+    TRACE_D("get: %s", name);
+    int rc = hcb_cache_copy_(cache, name, hcb);
+    hcb_cache_unlock(&cache);
+    return rc == 0 ? 0 : hcb_cache_load_get(name, hcb);
+}
+
+static int hcb_cache_save_later_(struct hcb_cache *self, struct hcb_entry *entry)
+{
+    int rc = 0;
+
+    g_hash_table_insert(self->dirty, entry, entry);
+
+    if (!self->is_flush_scheduled) {
+        struct itimerspec timeout = {
+            .it_interval = { .tv_sec = 0, .tv_nsec = 0 },
+            .it_value = { .tv_sec = 1, .tv_nsec = 0 }
+        };
+        rc = timerfd_settime(self->flush_fd, 0, &timeout, NULL);
+        if (!rc)
+            self->is_flush_scheduled = true;
+        else
+            TRACE_D("rc=%d setting timer", rc);
+    }
+    return rc;
+}
+
+static int hcb_cache_save_(struct hcb_cache *self, struct hcb_entry *entry)
+{
+    int rc;
+    if (is_ll_write_cached) {
+        rc = hcb_cache_save_later_(self, entry);
+    } else {
+        rc = hcb_entry_file_save(entry);
+        if (rc < 0) {
+            TRACE_W("Can't save %s", entry->path);
+            // TODO g_hash_table_insert(self->dirty, entry, entry);
+        }
+    }
+    return rc;
+}
+
+static int hcb_cache_set(char const *name, struct ll_hcb const *hcb)
+{
+    int rc;
+    struct hcb_cache *cache = hcb_cache_lock_write();
+    struct hcb_entry *entry = hcb_cache_find_(cache->data, name);
+    TRACE_D("set: %s=%p", name, entry);
+    if (hcb) {
+        if (entry) {
+            if (memcmp(&entry->ll, hcb, sizeof(entry->ll))) {
+                memcpy(&entry->ll, hcb, sizeof(entry->ll));
+                rc = hcb_cache_save_(cache, entry);
+            } else {
+                rc = 0;
+            }
+        } else {
+            entry = malloc(sizeof(entry[0]));
+            rc = hcb_entry_from(entry, name, hcb);
+            if (!rc) {
+                rc = hcb_cache_save_(cache, entry);
+                g_hash_table_insert(cache->data, g_strdup(name), entry);
+            } else {
+                hcb_entry_release(entry);
+                rc = -1;
+            }
+        }
+    } else {
+        TRACE_E("null ll_hcb: %s", name);
+        rc = -1;
+    }
+    hcb_cache_unlock(&cache);
+    TRACE_D("rc=%d", rc);
+    return rc;
+}
+
+static void hcb_cache_entry_flush_
+(gpointer key, gpointer value, gpointer user_data)
+{
+    struct hcb_cache_save_result *res
+        = (struct hcb_cache_save_result *)user_data;
+    struct hcb_entry *self = value;
+    int rc = hcb_entry_file_save(self);
+    if (!rc) {
+        ++res->count;
+    } else {
+        TRACE_W("Can't save %s, postpone", self->path);
+        res->rc = rc;
+        g_hash_table_insert(res->left, self, self);
+    }
+}
+
+static int hcb_cache_flush_(struct hcb_cache *cache)
+{
+    struct hcb_cache_save_result res;
+    int count = g_hash_table_size(cache->dirty);
+    if (count) {
+        hcb_cache_save_result_init(&res);
+        TRACE_D("%d entries to flush", count);
+        g_hash_table_foreach(cache->dirty, hcb_cache_entry_flush_, &res);
+        TRACE_D("%d entries is flushed", res.count);
+        int left_count = g_hash_table_size(res.left);
+        if (left_count) {
+            if (res.rc < 0)
+                TRACE_E("Error writing cache entries %d, still dirty %d\n"
+                        , res.rc, left_count);
+            else
+                TRACE_W("After flushing still dirty %d entries...\n"
+                        , left_count);
+            g_hash_table_destroy(cache->dirty);
+            cache->dirty = res.left;
+            res.left = NULL;
+        } else {
+            g_hash_table_remove_all(cache->dirty);
+            if (res.rc < 0)
+                TRACE_E("There was some error while flushing cache? rc %d\n"
+                        , res.rc);
+        }
+        hcb_cache_save_result_release(&res);
+    }
+    return res.rc;
+}
+
+static int hcb_cache_renameat(char const *from, char const *to)
+{
+	int rc;
+    TRACE_D("%s->%s", from, to);
+    struct hcb_cache *cache = hcb_cache_lock_write();
+    rc = renameat(root_fd, from, root_fd, to);
+    if (!rc) {
+        struct hcb_entry *entry = hcb_cache_find_(cache->data, from);
+        if (entry) {
+            TRACE_D("replacing %s with %s", to, from);
+            if (g_hash_table_steal(cache->data, from)) {
+                g_hash_table_replace(cache->data, g_strdup(to), entry);
+            }
+        }
+    }
+    hcb_cache_unlock(&cache);
+    return rc;
+}
+
+static int hcb_cache_unlinkat(char const *name, int flags)
+{
+    TRACE_D("%s", name);
+    struct hcb_cache *cache = hcb_cache_lock_write();
+    int rc = unlinkat(root_fd, name, 0);
+    if (!rc) {
+        struct hcb_entry *entry = hcb_cache_find_(cache->data, name);
+        if (entry) {
+            g_hash_table_remove(cache->dirty, entry);
+            g_hash_table_remove(cache->data, name);
+        }
+    }
+    hcb_cache_unlock(&cache);
+    return rc;
+}
+
+static void* flush_thread(void *arg)
+{
+    int rc;
+    bool is_run = true;
+    TRACE_D("Started with arg %p", arg);
+    struct hcb_cache *cache = hcb_cache_lock_read();
+    struct pollfd fds = { .fd = cache->flush_fd
+                          , .events = POLLIN | POLLPRI
+                          , .revents = 0};
+    hcb_cache_unlock(&cache);
+    while (is_run) {
+        rc = poll(&fds, 1, -1);
+        TRACE_D("Flush event, rc=%d", rc);
+        if (rc < 0) {
+            TRACE_E("poll error %d", rc);
+            is_run = false;
+        } else if (fds.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            TRACE_E("poll revents=%x, exiting", fds.revents);
+            break;
+        } else {
+            uint64_t i;
+            rc = read(fds.fd, &i, sizeof(i));
+            cache = hcb_cache_lock_write();
+            cache->is_flush_scheduled = false;
+            rc = hcb_cache_flush_(cache);
+            if (rc < 0) {
+                TRACE_E("flush rc=%d", rc);
+            }
+            if (cache->is_exit) {
+                TRACE_D("Exiting from the flush thread %d", rc);
+                is_run = false;
+            }
+            hcb_cache_unlock(&cache);
+        }
+
+    }
+    return NULL;
+}
+
 /**
  * hcb_get - read HCB
  * @path:	fuse-namespace relative file path (L0)
@@ -440,6 +932,7 @@ static int hcb_get(const char *path, struct hcb *cb)
 {
 	int ret;
 
+    TRACE_D("path=%s", path);
     hcb_init(cb);
 
 	/* Get inode number, size and times from the L0 file */
@@ -454,20 +947,9 @@ static int hcb_get(const char *path, struct hcb *cb)
 	if ((ret = real_to_hcb(cb->path, path)) < 0)
 		return ret;
 
-	if (hcb_openat(cb, root_fd, at(cb->path), O_RDONLY) < 0) {
-		return (errno == ENOENT) ? -ENOENT_HCB : -errno;
-	}
-
-	if (lock_read(cb->fd) < 0) {
-		ret = -errno;
-		hcb_close(cb, should_be_valid);
-		return ret;
-	}
-	ret = ll_hcb_read(cb->path, &cb->ll, cb->fd);
-	if (ret < 0) {
-		hcb_close(cb, should_be_valid);
-		return ret;
-	}
+    ret = hcb_cache_get(at(cb->path), &cb->ll);
+    if (ret < 0)
+        return (ret == -ENOENT ? -ENOENT_HCB : ret);
 
 	/* and extra attributes from the L0 HCB */
 	cb->sb.st_mode  = cb->ll.mode;
@@ -504,7 +986,6 @@ static void hcb_put(struct hcb *cb)
 static int hcb_deref(struct hcb *cb)
 {
 	struct stat sb;
-	int ret;
 
 	if (!S_ISHARDLNK(cb->ll.mode))
 		return 0;
@@ -522,18 +1003,8 @@ static int hcb_deref(struct hcb *cb)
 	cb->sb.st_mtime = sb.st_mtime;
 
 	hl_dtoi(cb->path, cb->ll.target);
-	if (hcb_openat(cb, root_fd, at(cb->path), O_RDONLY) < 0)
+	if (hcb_cache_get(at(cb->path), &cb->ll))
 		return -errno;
-	if (lock_read(cb->fd) < 0) {
-		ret = -errno;
-		hcb_close(cb, should_be_valid);
-		return ret;
-	}
-	ret = ll_hcb_read(cb->path, &cb->ll, cb->fd);
-	if (ret < 0) {
-		hcb_close(cb, should_be_valid);
-		return ret;
-	}
 
 	/* ...and some on the L1 HCB */
 	cb->sb.st_mode  = cb->ll.mode;
@@ -576,21 +1047,9 @@ static int hcb_get_deref(const char *path, struct hcb *cb)
 static int hcb_update(struct hcb *cb)
 {
 	int ret;
-    int flags = O_WRONLY;
 
-    /* When this HCB was created using hcb_new() */
-    if (!hcb_close(cb, could_be_invalid))
-        flags |= (O_CREAT | O_EXCL);
-
-    cb->fd = openat(root_fd, at(cb->path), flags, S_IRUGO | S_IWUSR);
-    if (cb->fd < 0)
-        return -errno;
-
-    ret = (lock_write(cb->fd) >= 0
-           ? ll_hcb_write(cb->path, &cb->ll, cb->fd)
-           : -errno);
-
-	hcb_put(cb);
+    ret = hcb_cache_set(at(cb->path), &cb->ll);
+    hcb_put(cb);
 	return ret;
 }
 
@@ -1065,19 +1524,19 @@ static int hl_demote(const char *l0_file, const char *l0_hcb,
 	int ret = 0;
 
 	pthread_mutex_lock(&posixovl_protect);
-	if (unlinkat(root_fd, at(l0_file), 0) < 0) {
+	if (hcb_cache_unlinkat(at(l0_file), 0) < 0) {
 		pthread_mutex_unlock(&posixovl_protect);
 		return -errno;
 	}
-	unlinkat(root_fd, at(l0_hcb), 0);
-	if (renameat(root_fd, at(l1_hcb), root_fd, at(l0_hcb)) < 0) {
+	hcb_cache_unlinkat(at(l0_hcb), 0);
+	if (hcb_cache_renameat(at(l1_hcb), at(l0_hcb)) < 0) {
 		pthread_mutex_unlock(&posixovl_protect);
 		ret = -errno;
 		fprintf(stderr, "%s: rename %s -> %s failed: %s\n",
 		        __func__, l1_hcb, l0_hcb, strerror(errno));
 		return ret;
 	}
-	if (renameat(root_fd, at(l1_file), root_fd, at(l0_file)) < 0) {
+	if (hcb_cache_renameat(at(l1_file), at(l0_file)) < 0) {
 		ret = -errno;
 		fprintf(stderr, "%s: rename %s -> %s failed: %s\n",
 		        __func__, l1_file, l0_file, strerror(errno));
@@ -1240,14 +1699,13 @@ static int hl_promote(const char *l0_path, const struct hcb *orig_info,
 	} while (true);
 
 	/* Move L0 to L1 */
-	ret = renameat(root_fd, at(l0_path), root_fd, at(l1_path));
+	ret = hcb_cache_renameat(at(l0_path), at(l1_path));
 	if (ret < 0)
 		return -errno;
 
 	/* move L0 HCB to L1 HCB */
 	if (l0_hcb_exists) {
-		ret = renameat(root_fd, at(orig_info->path),
-		      root_fd, at(l1_hcb));
+		ret = hcb_cache_renameat(at(orig_info->path), at(l1_hcb));
 		if (ret < 0) {
 			ret = -errno;
 			goto out;
@@ -1280,12 +1738,12 @@ static int hl_promote(const char *l0_path, const struct hcb *orig_info,
 	return 0;
 
  out3:
-	unlinkat(root_fd, at(orig_info->path), 0);
+	hcb_cache_unlinkat(at(orig_info->path), 0);
  out2:
 	if (l0_hcb_exists)
-		renameat(root_fd, at(l1_hcb), root_fd, at(orig_info->path));
+		hcb_cache_renameat(at(l1_hcb), at(orig_info->path));
  out:
-	renameat(root_fd, at(l1_path), root_fd, at(l0_path));
+	hcb_cache_renameat(at(l1_path), at(l0_path));
 	return ret;
 }
 
@@ -1333,8 +1791,8 @@ static int hl_drop(const char *l1_path)
 	if (cb.ll.nlink == 1) {
 		hcb_put(&cb);
 		pthread_mutex_lock(&posixovl_protect);
-		unlinkat(root_fd, at(l1_path), 0);
-		unlinkat(root_fd, at(cb.path), 0);
+		hcb_cache_unlinkat(at(l1_path), 0);
+		hcb_cache_unlinkat(at(cb.path), 0);
 		pthread_mutex_unlock(&posixovl_protect);
 		return 0;
 	}
@@ -1399,7 +1857,7 @@ static int hl_instantiate(const char *oldpath, const char *newpath)
 	return 0;
 
  out2:
-	unlinkat(root_fd, at(cb_new.path), 0);
+	hcb_cache_unlinkat(at(cb_new.path), 0);
  out:
 	hl_drop(cb_old.ll.target);
 	return ret;
@@ -1529,7 +1987,7 @@ static int posixovl_mknod(const char *path, mode_t mode, dev_t rdev)
 	fd = openat(root_fd, at(path), O_WRONLY | O_CREAT | O_EXCL, 0);
 	if (fd < 0) {
 		ret = -errno;
-		unlinkat(root_fd, at(info.path), 0);
+		hcb_cache_unlinkat(at(info.path), 0);
 	}
 	close(fd);
 	return ret;
@@ -1690,8 +2148,7 @@ static int posixovl_rename(const char *oldpath, const char *newpath)
 
 	ret = hcb_lookup(oldpath, &old_info);
 	if (ret == -ENOENT_HCB || S_ISDIR(old_info.sb.st_mode))
-		return retcode_int(renameat(root_fd, at(oldpath),
-		       root_fd, at(newpath)));
+		return retcode_int(hcb_cache_renameat(at(oldpath), at(newpath)));
 	else if (ret < 0)
 		return ret;
 
@@ -1699,19 +2156,19 @@ static int posixovl_rename(const char *oldpath, const char *newpath)
 		return ret;
 
 	pthread_mutex_lock(&posixovl_protect);
-	ret_2 = renameat(root_fd, at(oldpath), root_fd, at(newpath));
+	ret_2 = hcb_cache_renameat(at(oldpath), at(newpath));
 	if (ret_2 < 0) {
 		ret = -errno;
 		pthread_mutex_unlock(&posixovl_protect);
 		return ret;
 	}
-	ret_2 = renameat(root_fd, at(old_info.path), root_fd, at(new_hcbpath));
+	ret_2 = hcb_cache_renameat(at(old_info.path), at(new_hcbpath));
 	if (ret_2 < 0) {
 		/* !@#$%^& - error. Need to rename old file back. */
 		ret = -errno;
-		if (renameat(root_fd, at(newpath), root_fd, at(oldpath)) < 0) {
+		if (hcb_cache_renameat(at(newpath), at(oldpath)) < 0) {
 			/* Even that failed. Keep new name, but kill HCB. */
-			unlinkat(root_fd, at(old_info.path), 0);
+			hcb_cache_unlinkat(at(old_info.path), 0);
 			hcb_got_busted(old_info.path);
 		}
 
@@ -1741,9 +2198,9 @@ static int posixovl_rmdir(const char *path)
 	if (is_resv(path))
 		return -ENOENT;
 	ret = hcb_lookup(path, &info);
-	if (ret == 0 && unlinkat(root_fd, at(info.path), 0) < 0)
+	if (ret == 0 && hcb_cache_unlinkat(at(info.path), 0) < 0)
 		return -errno;
-	return retcode_int(unlinkat(root_fd, at(path), AT_REMOVEDIR));
+	return retcode_int(hcb_cache_unlinkat(at(path), AT_REMOVEDIR));
 }
 
 static int posixovl1_rmdir(const char *path)
@@ -1801,7 +2258,7 @@ static int posixovl_symlink(const char *oldpath, const char *newpath)
 	fd = openat(root_fd, at(newpath), O_WRONLY | O_CREAT | O_EXCL, 0);
 	if (fd < 0) {
 		ret = -errno;
-		unlinkat(root_fd, at(info.path), 0);
+		hcb_cache_unlinkat(at(info.path), 0);
 	} else {
 		close(fd);
 	}
@@ -1886,12 +2343,12 @@ static int posixovl_unlink(const char *path)
 	if (h_ret < 0 && h_ret != -ENOENT_HCB)
 		return h_ret;
 
-	ret = unlinkat(root_fd, at(path), 0);
+	ret = hcb_cache_unlinkat(at(path), 0);
 	if (ret < 0)
 		return -errno;
 
 	if (h_ret == 0) {
-		unlinkat(root_fd, at(info.path), 0);
+		hcb_cache_unlinkat(at(info.path), 0);
 		if (S_ISHARDLNK(info.ll.mode))
 			hl_drop(info.ll.target);
 	}
@@ -2018,7 +2475,7 @@ static const struct fuse_operations posixovl_ops = {
 static void usage(const char *p)
 {
 	fprintf(stderr,
-	        "Usage: %s [-FH] [-S source] mountpoint [-- fuseoptions]\n", p);
+	        "Usage: %s [-FHC] [-S source] mountpoint [-- fuseoptions]\n", p);
 	exit(EXIT_FAILURE);
 }
 
@@ -2028,14 +2485,18 @@ int main(int argc, char **argv)
 	int new_argc = 0, original_wd, c;
 	char xargs[256];
 
-	while ((c = getopt(argc, argv, "1FHS:")) > 0) {
+	while ((c = getopt(argc, argv, "1FHCS:")) > 0) {
 		switch (c) {
 			case '1':
-				single_threaded = true;
+				is_single_threaded = true;
+                threading = &single_threaded;
 				break;
 			case 'F':
 				assume_vfat = true;
 				break;
+            case 'C':
+                is_ll_write_cached = true;
+                break;
 			case 'H':
 				hardlink_with_copy = true;
 				break;
@@ -2077,14 +2538,16 @@ int main(int argc, char **argv)
 
 	if (user_allow_other())
 		new_argv[new_argc++] = "-oallow_other";
-	if (single_threaded)
+	if (is_single_threaded)
 		new_argv[new_argc++] = "-s";
 
 	for (aptr = &argv[optind]; *aptr != NULL; ++aptr)
 		new_argv[new_argc++] = *aptr;
 
 	new_argv[new_argc] = NULL;
+    hcb_cache_init(&hcb_cache);
 	c = fuse_main(new_argc, (char **)new_argv, &posixovl_ops, NULL);
+    hcb_cache_release();
 	if (fchdir(original_wd) < 0)
 		/* ignore */{}
 	return c;
